@@ -1,10 +1,11 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 /*
- * Copyright (c) 2024, Tangent65536.
+ * Copyright (c) 2024-2025, Tangent65536.
  * All rights reserved.
  *
  * License: GNU AGPLv3
@@ -15,6 +16,7 @@ function parse_ascii_cstring_buf(buf, off, lim)
 {
   let i = 0;
 
+  off = off ? off : 0;
   lim = lim ? Math.min(buf.length, off + lim) : buf.length;
   for(i = off ; i < lim ; i++)
   {
@@ -126,6 +128,16 @@ function extract_c2(buf)
     return rdata;
   }
 
+  let ret = extract_c2_v1(rdata);
+  if(ret.results)
+  {
+    return ret;
+  }
+  return extract_c2_v2(rdata);
+}
+
+function extract_c2_v1(rdata)
+{
   // Currently there are always exactly 9 C2 entries.
   const DEFINED_C2_ENTRIES = 9;
 
@@ -189,13 +201,90 @@ function extract_c2(buf)
       }
 
       return {
-        results: test_strings
+        results: test_strings,
+        ver: 1
       };
     }
   }
 
   return {
-    error: 'Unable to locate the encrypted C2 strings array. Have you unpacked the sample?'
+    error: 'Unable to locate the (v1) encrypted C2 strings array. Have you unpacked the sample?'
+  };
+}
+
+function extract_c2_v2(rdata)
+{
+  // There are also always exactly 9 C2 entries in the latest version.
+  const DEFINED_C2_ENTRIES = 9;
+
+  let valid_addr_streak = 0;
+  let arr_rrva = -1;
+  let valid_rrva_arr = new Uint32Array(DEFINED_C2_ENTRIES);
+  for(let i = 0 ; i < (rdata.data.length - 3) ; i += 4)
+  {
+    let test_rrva = rdata.data.readUInt32LE(i) - rdata.image_base - rdata.rva;
+    if(test_rrva < 0 || (test_rrva + 0x80) >= rdata.data.length)
+    {
+      valid_addr_streak = 0;
+      continue;
+    }
+
+    // An artifact of Lumma, that is, a C2 string must not exceed the length of 0x80 bytes (c2str[i][0x80] is the NULL termination)
+    if(rdata.data[test_rrva + 0x80] !== 0)
+    {
+      valid_addr_streak = 0;
+      continue;
+    }
+
+    // If there's more than one test entries, check the gap sizes between them and make sure it's 0x81. Just a compiler artifact that's a nice constant.
+    if(valid_addr_streak)
+    {
+      if(Math.abs(valid_rrva_arr[valid_addr_streak - 1] - test_rrva) % 0x81)
+      {
+        // Gap is weird, mark it as invalid.
+        valid_addr_streak = 0;
+        continue;
+      }
+    }
+    else
+    {
+      arr_rrva = i;
+    }
+
+    valid_rrva_arr[valid_addr_streak++] = test_rrva;
+    if(valid_addr_streak === DEFINED_C2_ENTRIES)
+    {
+      // Found the array!
+      break;
+    }
+  }
+
+  if(valid_addr_streak === DEFINED_C2_ENTRIES)
+  {
+    let ret = new Array(DEFINED_C2_ENTRIES);
+    
+    let key = rdata.data.subarray(arr_rrva - 40, arr_rrva - 8);
+    let iv = Buffer.allocUnsafe(16);
+    iv.fill(0, 0, 8);
+    rdata.data.copy(iv, 8, arr_rrva - 8, arr_rrva);
+
+    let dcp = crypto.createDecipheriv('chacha20', key, iv);
+    for(let i = 0 ; i < DEFINED_C2_ENTRIES ; i++)
+    {
+      let enc = rdata.data.subarray(valid_rrva_arr[i], valid_rrva_arr[i] + 0x80);
+      let dec = dcp.update(enc);
+      ret[i] = parse_ascii_cstring(dec);
+    }
+    dcp.final(); // Should be blank.
+
+    return {
+      results: ret,
+      ver: 2
+    };
+  }
+
+  return {
+    error: 'Unable to locate the (v2) encrypted C2 strings array. Have you unpacked the sample?'
   };
 }
 
@@ -227,7 +316,7 @@ function __main__(args)
   }
   else
   {
-    console.log('Found C2:');
+    console.log('Found C2 (v%d):', ret.ver);
     for(let i = 0 ; i < ret.results.length ; i++)
     {
       console.log('[%d] %s', i, ret.results[i]);
